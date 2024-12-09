@@ -192,11 +192,11 @@ class TrainLoop:
             self.save()
 
     def run_step(self, batch, cond):
-        self.forward_backward(batch, cond)
+        self.forward_backward(batch, cond) # Loss is calculated here
         if self.use_fp16:
             self.optimize_fp16()
         else:
-            self.optimize_normal()
+            self.optimize_normal() # Applies the updates
         self.log_step()
 
     def forward_only(self, batch, cond):
@@ -242,7 +242,7 @@ class TrainLoop:
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
             # print(micro_cond.keys())
             compute_losses = functools.partial(
-                self.diffusion.training_losses,
+                self.diffusion.training_losses, # calculates losses
                 self.ddp_model,
                 micro,
                 t,
@@ -309,7 +309,7 @@ class TrainLoop:
             self.grad_clip()
         self._log_grad_norm()
         self._anneal_lr()
-        self.opt.step()
+        self.opt.step() # This is where the embedding weights get updated
         for rate, params in zip(self.ema_rate, self.ema_params):
             update_ema(params, self.master_params, rate=rate)
 
