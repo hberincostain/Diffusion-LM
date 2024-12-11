@@ -1,17 +1,20 @@
-"""
-Core diffusion utilities for text generation.
-"""
-
 import enum
 import math
 import numpy as np
 import torch as th
+from torch import nn
 
-from .nn import mean_flat
-from .losses import normal_kl, discretized_text_log_likelihood
+# ----------------------- Utility Functions -----------------------
+
+def normal_kl(mean1, logvar1, mean2, logvar2):
+    # Dummy function for demonstration, not a true KL calculation
+    return mean_flat((mean1 - mean2)**2 + (th.exp(logvar1) - th.exp(logvar2)))
+
+def discretized_text_log_likelihood(x, logits):
+    # Dummy function for demonstration, just returns a placeholder value
+    return mean_flat(-th.log_softmax(logits, dim=-1).gather(dim=-1, index=x.unsqueeze(-1)).squeeze(-1))
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
-    """Get pre-defined beta schedule."""
     if schedule_name == "linear":
         scale = 1000 / num_diffusion_timesteps
         beta_start = scale * 0.0001
@@ -25,13 +28,12 @@ def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
     elif schedule_name == "sqrt":
         return betas_for_alpha_bar(
             num_diffusion_timesteps,
-            lambda t: 1-np.sqrt(t + 0.0001),
+            lambda t: 1 - np.sqrt(t + 0.0001),
         )
     else:
         raise NotImplementedError(f"unknown beta schedule: {schedule_name}")
 
 def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
-    """Create a beta schedule that discretizes the given alpha_t_bar function."""
     betas = []
     for i in range(num_diffusion_timesteps):
         t1 = i / num_diffusion_timesteps
@@ -40,24 +42,25 @@ def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
     return np.array(betas)
 
 class ModelMeanType(enum.Enum):
-    """Which type of output the model predicts."""
     START_X = enum.auto()  # the model predicts x_0
     EPSILON = enum.auto()  # the model predicts epsilon
 
 class ModelVarType(enum.Enum):
-    """What is used as the model's output variance."""
     FIXED_SMALL = enum.auto()
     FIXED_LARGE = enum.auto()
     LEARNED_RANGE = enum.auto()
 
 class LossType(enum.Enum):
-    E2E_MSE = enum.auto()
-    E2E_KL = enum.auto()
+    POINT_MSE = enum.auto()  # MSE for point cloud embeddings
+    POINT_KL = enum.auto()   # KL for point cloud embeddings
+    MSE = enum.auto()
+    RESCALED_MSE = enum.auto()
+    KL = enum.auto()
+    RESCALED_KL = enum.auto()
+
+# ----------------------- GaussianDiffusion Class -----------------------
 
 class GaussianDiffusion:
-    """
-    Utilities for training and sampling diffusion models.
-    """
     def __init__(
         self,
         *,
@@ -66,20 +69,17 @@ class GaussianDiffusion:
         model_var_type,
         loss_type,
         rescale_timesteps=False,
-        model_arch='transformer',
-        training_mode='e2e',
     ):
+        # Keep existing initialization code
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
         self.rescale_timesteps = rescale_timesteps
-        self.model_arch = model_arch
-        self.training_mode = training_mode
 
-        # Use float64 for accuracy.
+        # Process beta schedule
         betas = np.array(betas, dtype=np.float64)
         self.betas = betas
-        assert len(betas.shape) == 1, "betas must be 1-D"
+        assert len(betas.shape) == 1
         assert (betas > 0).all() and (betas <= 1).all()
 
         self.num_timesteps = int(betas.shape[0])
@@ -112,92 +112,50 @@ class GaussianDiffusion:
             / (1.0 - self.alphas_cumprod)
         )
 
-    def q_mean_variance(self, x_start, t):
-        """Get the distribution q(x_t | x_0)."""
-        mean = _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-        variance = _extract_into_tensor(1.0 - self.alphas_cumprod, t, x_start.shape)
-        log_variance = _extract_into_tensor(self.log_one_minus_alphas_cumprod, t, x_start.shape)
-        return mean, variance, log_variance
-
     def q_sample(self, x_start, t, noise=None):
-        """Sample from q(x_t | x_0)."""
+        """
+        Diffuse the data (t == 0 means no diffusion)
+        """
         if noise is None:
             noise = th.randn_like(x_start)
+        
+        assert noise.shape == x_start.shape
         return (
             _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
             + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def get_x_start(self, x_start_mean, std):
-        """Sample x_start using the reparameterization trick."""
-        noise = th.randn_like(x_start_mean)
-        return x_start_mean + std * noise
-
-    def _predict_xstart_from_eps(self, x_t, t, eps):
-        return (
-            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
-            - _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
-        )
-
-    def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
-        return (
-            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
-            - pred_xstart
-        ) / _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
-
-    def _scale_timesteps(self, t):
-        if self.rescale_timesteps:
-            return t.float() * (1000.0 / self.num_timesteps)
-        return t
-
-    def p_mean_variance(self, model, x_t, t, clip_denoised=True, model_kwargs=None):
-        """Get model predictions."""
+    def p_mean_variance(self, model, x_t, t, clip_denoised=True, denoised_fn=None, model_kwargs=None):
+        """
+        Apply the model to get p(x_{t-1} | x_t)
+        """
         if model_kwargs is None:
             model_kwargs = {}
-            
-        B, C = x_t.size(0), x_t.size(-1)
+
+        B, D = x_t.shape
         assert t.shape == (B,)
 
+        # Direct prediction of noise
         model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
-        # Split output if model predicts variance
-        if self.model_var_type in [ModelVarType.LEARNED_RANGE]:
-            assert model_output.shape == (B, x_t.size(1), C * 2)
-            model_output, model_var_values = th.split(model_output, C, dim=-1)
-            min_log = _extract_into_tensor(
-                self.posterior_log_variance_clipped, t, x_t.shape
-            )
-            max_log = _extract_into_tensor(np.log(self.betas), t, x_t.shape)
-            frac = (model_var_values + 1) / 2
-            model_log_variance = frac * max_log + (1 - frac) * min_log
-            model_variance = th.exp(model_log_variance)
-        else:
-            model_variance, model_log_variance = {
-                ModelVarType.FIXED_LARGE: (
-                    np.append(self.posterior_variance[1], self.betas[1:]),
-                    np.log(np.append(self.posterior_variance[1], self.betas[1:])),
-                ),
-                ModelVarType.FIXED_SMALL: (
-                    self.posterior_variance,
-                    self.posterior_log_variance_clipped,
-                ),
-            }[self.model_var_type]
-            model_variance = _extract_into_tensor(model_variance, t, x_t.shape)
-            model_log_variance = _extract_into_tensor(model_log_variance, t, x_t.shape)
-
-        def process_xstart(x):
-            if clip_denoised:
-                return x.clamp(-1, 1)
-            return x
-
+        # Convert model output to mean and variance
         if self.model_mean_type == ModelMeanType.START_X:
-            pred_xstart = process_xstart(model_output)
-        else:
-            pred_xstart = process_xstart(
-                self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
+            pred_xstart = model_output
+            model_mean, _, _ = self.q_posterior_mean_variance(
+                x_start=pred_xstart, x_t=x_t, t=t
             )
-        
-        model_mean, _, _ = self.q_posterior_mean_variance(x_start=pred_xstart, x_t=x_t, t=t)
+        else:  # EPSILON case
+            pred_xstart = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
+            model_mean, _, _ = self.q_posterior_mean_variance(
+                x_start=pred_xstart, x_t=x_t, t=t
+            )
+
+        if clip_denoised:
+            pred_xstart = pred_xstart.clamp(-1, 1)
+
+        # Get variance
+        model_variance = _extract_into_tensor(self.posterior_variance, t, x_t.shape)
+        model_log_variance = _extract_into_tensor(self.posterior_log_variance_clipped, t, x_t.shape)
 
         return {
             "mean": model_mean,
@@ -206,84 +164,159 @@ class GaussianDiffusion:
             "pred_xstart": pred_xstart,
         }
 
-    def q_posterior_mean_variance(self, x_start, x_t, t):
-        """Compute the mean and variance of the diffusion posterior."""
-        assert x_start.shape == x_t.shape
-        posterior_mean = (
-            _extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape) * x_start
-            + _extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape) * x_t
+    def p_sample(self, model, x_t, t, noise_fn=None, clip_denoised=True, denoised_fn=None, model_kwargs=None):
+        """
+        Sample p(x_{t-1} | x_t)
+        """
+        out = self.p_mean_variance(
+            model,
+            x_t,
+            t,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            model_kwargs=model_kwargs,
         )
-        posterior_variance = _extract_into_tensor(self.posterior_variance, t, x_t.shape)
-        posterior_log_variance_clipped = _extract_into_tensor(
-            self.posterior_log_variance_clipped, t, x_t.shape
-        )
-        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+        noise = noise_fn or th.randn_like
+        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x_t.shape) - 1)))
+        sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise(x_t)
+        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
-    # THIS IS WHERE EMBREDDING TRAINING HAPPENS
-        
-    def training_losses(self, model, x_start, t, model_kwargs=None):
-        """Compute training losses for a single timestep."""
+    def _predict_xstart_from_eps(self, x_t, t, eps):
+        """
+        Get x_0 prediction from epsilon
+        """
+        return (
+            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
+            - _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
+        )
+
+    def _scale_timesteps(self, t):
+        if self.rescale_timesteps:
+            return t.float() * (1000.0 / self.num_timesteps)
+        return t
+
+    def training_losses(self, model, x_start, t, points=None, target_formula=None, model_kwargs=None):
+        """
+        Compute training losses for a single timestep.
+        """
         if model_kwargs is None:
             model_kwargs = {}
 
-        input_ids = model_kwargs.pop('input_ids').to(t.device)
-        
-        # Converts input into embedding
-        x_start_mean = model.model.module.get_embeds(input_ids)
-        # Calcualtes standard deviation
-        std = _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod,
-                                 th.tensor([0]).to(x_start_mean.device),
-                                 x_start_mean.shape)
-        # Add noise using reparameterization trick
-        x_start_log_var = 2 * th.log(std)
-        # The embeddings then go through the diffusion process
-        # Add more noise based on timestep t
-        x_start = self.get_x_start(x_start_mean, std)
+        # Add noise to embeddings
         noise = th.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise=noise)
 
-        if self.loss_type == LossType.E2E_KL:
-            # KL loss calculation
-            terms = {}
-            out = self.p_mean_variance(model, x_t, t, model_kwargs=model_kwargs)
-            
-            # Calculate KL loss/the diffusion loss
+        # Get model prediction
+        model_output = model(points, t, **model_kwargs)
+
+        if self.model_mean_type == ModelMeanType.START_X:
+            target = x_start
+        else:
             target = noise
-            terms["loss"] = mean_flat((target - out["pred_xstart"]) ** 2)
-            
-            # Add token prediction loss
-            # TOKEN PREDICTION LOSS FOR EMBEDDINGS!
-            get_logits = model.model.module.get_logits
-            logits = get_logits(x_start)
-            token_loss = th.nn.CrossEntropyLoss(reduction='none')(
-                logits.view(-1, logits.size(-1)),
-                input_ids.view(-1)
-            ).mean()
 
-            # COMBINED LOSS TO UPDATE EMBEDDINGS
-            terms["loss"] = terms["loss"] + token_loss
-            
-        else:  # MSE loss
-            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
-            target = noise  # Predict noise
-            terms = {}
-            terms["loss"] = mean_flat((target - model_output) ** 2)
-            
-            # Add token prediction loss
-            get_logits = model.model.module.get_logits
-            logits = get_logits(x_start)
-            token_loss = th.nn.CrossEntropyLoss(reduction='none')(
-                logits.view(-1, logits.size(-1)),
-                input_ids.view(-1)
-            ).mean()
-            
-            terms["loss"] = terms["loss"] + token_loss
+        # MSE loss for diffusion
+        mse_loss = mean_flat((target - model_output) ** 2)
 
-        return terms
+        # Optional token prediction loss
+        token_loss = 0.0
+        if target_formula is not None:
+            logits = model(points, t * 0, return_logits=True)  # Use t=0 for clean predictions
+            token_loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                target_formula.view(-1),
+                reduction='mean'
+            )
+
+        loss = mse_loss + token_loss
+
+        return {
+            "loss": loss,
+            "mse": mse_loss,
+            "token_loss": token_loss,
+        }
 
 def _extract_into_tensor(arr, timesteps, broadcast_shape):
-    """Extract values from a 1-D numpy array for a batch of indices."""
+    """
+    Extract values from a 1-D numpy array for a batch of indices.
+    """
     res = th.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
     while len(res.shape) < len(broadcast_shape):
         res = res[..., None]
     return res.expand(broadcast_shape)
+
+def mean_flat(tensor):
+    """
+    Take the mean over all non-batch dimensions.
+    """
+    return tensor.mean(dim=list(range(1, len(tensor.shape))))
+
+# ----------------------- Inference Helper -----------------------
+
+def generate_embeddings(diffusion_model, model, initial_noise, num_timesteps):
+    x_t = initial_noise
+    # Diffusion loop
+    for step in reversed(range(num_timesteps)):
+        t = th.tensor([step], device=x_t.device, dtype=th.long)
+        with th.no_grad():
+            output = diffusion_model.p_mean_variance(
+                model=model,
+                x=x_t,
+                t=t,
+                clip_denoised=True
+            )
+            # Sample from the distribution using mean - For simplicity, we ignore variance sampling here.
+            # In a real scenario, you'd add noise according to model_variance for a stochastic sampling.
+            x_t = output["pred_xstart"]
+
+    return x_t  # These are embeddings
+
+def generate_tokens(diffusion_model, model, initial_noise, num_timesteps):
+    # First generate final embeddings from the diffusion process
+    final_embeddings = generate_embeddings(diffusion_model, model, initial_noise, num_timesteps)
+    # Convert embeddings to logits
+    logits = model.get_logits(final_embeddings)
+    # Argmax to get tokens
+    tokens = th.argmax(logits, dim=-1)
+    return tokens
+
+# ----------------------- Example Usage -----------------------
+if __name__ == "__main__":
+    # Initialize the Gaussian Diffusion model
+    betas = get_named_beta_schedule("linear", num_diffusion_timesteps=1000)
+    diffusion_model = GaussianDiffusion(
+        betas=betas,
+        model_mean_type=ModelMeanType.EPSILON,  # predicting epsilon
+        model_var_type=ModelVarType.FIXED_SMALL,
+        loss_type=LossType.POINT_MSE,
+    )
+
+    # Dummy transformer model that:
+    # - Predicts epsilon in the same embedding dimension as x_t
+    # After diffusion, we use another linear layer to get logits.
+    class DummyTransformer(nn.Module):
+        def __init__(self, embedding_dim, vocab_size):
+            super().__init__()
+            self.embedding_dim = embedding_dim
+            self.vocab_size = vocab_size
+
+            # Projection to predict eps (same dim as embedding)
+            self.eps_projection = nn.Linear(embedding_dim, embedding_dim)
+
+            # Separate projection for converting embeddings to logits after diffusion
+            self.to_logits = nn.Linear(embedding_dim, vocab_size)
+
+        def forward(self, x, t, **kwargs):
+            # x: (batch, seq_len, embedding_dim)
+            # We'll just return a predicted epsilon of the same shape
+            return self.eps_projection(x)
+
+        def get_logits(self, x):
+            # Convert embeddings to logits
+            return self.to_logits(x)
+
+    model = DummyTransformer(embedding_dim=128, vocab_size=512)
+
+    # Dummy inputs: random embeddings as initial noise
+    initial_noise = th.randn(16, 100, 128)  # (batch_size, seq_length, embedding_dim)
+    tokens = generate_tokens(diffusion_model, model, initial_noise, num_timesteps=1000)
+    print("Generated Tokens Shape:", tokens.shape)
